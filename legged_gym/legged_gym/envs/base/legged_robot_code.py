@@ -49,6 +49,7 @@ from typing import Tuple, Dict
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.gym_math import quat_apply_yaw, wrap_to_pi, torch_rand_sqrt_float
+from legged_gym.utils.math import euler_from_quaternion
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.envs.base.base_task_code import BaseTask
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
@@ -96,6 +97,16 @@ class LeggedRobot(BaseTask):
         self._init_buffers()
         self._prepare_reward_function()
 
+        # 与humanoid_robot.py对齐：检查并统一action_scale处理
+        # 如果配置中使用的是单一action_scale值，确保兼容性
+        if hasattr(self.cfg.control, 'action_scale'):
+            if isinstance(self.cfg.control.action_scale, (int, float)):
+                # 如果是单一值，将其应用到所有动作
+                single_action_scale = self.cfg.control.action_scale
+                print(f"{GREEN}使用统一的action_scale: {single_action_scale}{RESET}")
+            else:
+                print(f"{GREEN}使用per-dof的action_scale配置{RESET}")
+        
         # 标志位置 True
         self.init_done = True
 
@@ -602,7 +613,44 @@ class LeggedRobot(BaseTask):
             self.curriculum_count_max_cmd_diff_base_ang_vel_yaw = 1000
 
     def _init_buffers_others(self):
-        pass
+        # 初始化动作历史缓冲区（类似humanoid_robot.py）
+        if hasattr(self.cfg.env, 'history_len'):
+            history_len = self.cfg.env.history_len
+        else:
+            history_len = 10  # 默认历史长度
+        
+        self.action_history_buf = torch.zeros(self.num_envs, history_len, self.num_actions, 
+                                              dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # 初始化观测历史缓冲区
+        # 注意：这里我们需要在compute_observations之后才知道obs_buf的大小，所以先设置一个占位符
+        # 实际的初始化会在第一次compute_observations时完成
+        self.obs_history_len = history_len
+        self.obs_history_buf = None
+        
+        # 初始化姿态信息（roll, pitch, yaw）
+        self.roll = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+        self.pitch = torch.zeros(self.num_envs, device=self.device, requires_grad=False) 
+        self.yaw = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+        
+        # 初始化目标朝向相关变量（如果需要的话）
+        if hasattr(self.cfg, 'navigation') and hasattr(self.cfg.navigation, 'use_target_yaw'):
+            self.target_yaw = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+            self.next_target_yaw = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+        
+        # 初始化环境类型（可以根据具体需求设置）
+        self.env_class = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
+        
+        # 初始化接触滤波器
+        if hasattr(self, 'feet_indices'):
+            self.contact_filt = torch.zeros(self.num_envs, len(self.feet_indices), 
+                                          dtype=torch.bool, device=self.device, requires_grad=False)
+            self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), 
+                                           dtype=torch.bool, device=self.device, requires_grad=False)
+        else:
+            # 默认4个接触点
+            self.contact_filt = torch.zeros(self.num_envs, 4, dtype=torch.bool, device=self.device, requires_grad=False)
+            self.last_contacts = torch.zeros(self.num_envs, 4, dtype=torch.bool, device=self.device, requires_grad=False)
 
     # ---------------------------------------
 
@@ -640,7 +688,19 @@ class LeggedRobot(BaseTask):
     # ---------------------------------------
 
     def clip_actions(self, actions):
-        actions_clipped = torch.clip(actions, self.clip_actions_min, self.clip_actions_max).to(self.device)
+        # 与humanoid_robot.py对齐：考虑action_scale的动作裁剪
+        if hasattr(self.cfg.control, 'action_scale'):
+            if isinstance(self.cfg.control.action_scale, (int, float)):
+                # 如果action_scale是单一值（与humanoid_robot.py一致）
+                clip_actions = self.cfg.normalization.clip_actions / self.cfg.control.action_scale
+                actions_clipped = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+            else:
+                # 如果action_scale是字典结构，使用原来的方法
+                actions_clipped = torch.clip(actions, self.clip_actions_min, self.clip_actions_max).to(self.device)
+        else:
+            # 如果没有定义action_scale，使用原来的方法
+            actions_clipped = torch.clip(actions, self.clip_actions_min, self.clip_actions_max).to(self.device)
+        
         return actions_clipped
 
     def step(self, actions):
@@ -649,12 +709,22 @@ class LeggedRobot(BaseTask):
         Args:
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
         """
+        
+        # 确保动作在正确的设备上（与humanoid_robot.py对齐）
+        actions = actions.to(self.device)
 
         """
         Jason 2025-03-08:
         clone() make sure that the actions_untreated is not changed.
         """
         self.actions_untreated = actions.clone()
+        
+        # 更新动作历史缓冲区（与humanoid_robot.py对齐）- 使用原始动作
+        if hasattr(self, 'action_history_buf'):
+            self.action_history_buf = torch.cat([
+                self.action_history_buf[:, 1:].clone(), 
+                actions[:, None, :].clone()
+            ], dim=1)
 
         """
         Jason 2024-11-22:
@@ -662,7 +732,15 @@ class LeggedRobot(BaseTask):
         - actions 在传入之前，已经被 OnPolicyRunner 完成了数据的记录了。
         - self.actions 只是一个 buffer，用于传入 observations 和 rewards 的计算。
         """
-        self.actions = self.clip_actions(actions)
+        
+        # 动作裁剪（与humanoid_robot.py对齐）
+        if hasattr(self.cfg.control, 'action_scale') and isinstance(self.cfg.control.action_scale, (int, float)):
+            # 使用humanoid_robot.py的裁剪方式
+            clip_actions = self.cfg.normalization.clip_actions / self.cfg.control.action_scale
+            self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+        else:
+            # 使用原来的clip_actions方法
+            self.actions = self.clip_actions(actions)
 
         self.before_physics_step()
         self.render()
@@ -846,6 +924,19 @@ class LeggedRobot(BaseTask):
                      (self.cfg.domain_rand.drag_interval - self.cfg.domain_rand.drag_keep))
         ):
             drag_forces, drag_torques = self._drag_robots()
+            
+        # 计算姿态角度（roll, pitch, yaw）- 与humanoid_robot.py对齐
+        self.roll, self.pitch, self.yaw = euler_from_quaternion(self.base_quat)
+        
+        # 更新接触信息
+        if hasattr(self, 'feet_indices'):
+            contact = torch.norm(self.contact_forces[:, self.feet_indices], dim=-1) > 2.0
+        else:
+            # 如果没有定义feet_indices，假设使用前4个接触点
+            contact = torch.norm(self.contact_forces[:, :4], dim=-1) > 2.0
+            
+        self.contact_filt = torch.logical_or(contact, self.last_contacts)
+        self.last_contacts = contact
 
     def check_termination(self):
         """
@@ -1025,18 +1116,82 @@ class LeggedRobot(BaseTask):
                        max=1.0)
 
     def compute_observation_profile(self):
+        # 计算IMU观测（roll, pitch从base_projected_gravity推导）
+        # base_projected_gravity的x, y分量可以反映roll和pitch信息
+        imu_obs = torch.stack((
+            torch.atan2(-self.base_projected_gravity[:, 1], self.base_projected_gravity[:, 2]),  # roll
+            torch.atan2(self.base_projected_gravity[:, 0], torch.sqrt(self.base_projected_gravity[:, 1]**2 + self.base_projected_gravity[:, 2]**2))  # pitch
+        ), dim=1)
+        
+        # 计算朝向差异（如果没有目标朝向系统，用零填充）
+        if hasattr(self, 'target_yaw') and hasattr(self, 'yaw'):
+            delta_yaw = self.target_yaw - self.yaw
+            if hasattr(self, 'next_target_yaw'):
+                delta_next_yaw = self.next_target_yaw - self.yaw
+            else:
+                delta_next_yaw = torch.zeros_like(delta_yaw)
+        else:
+            delta_yaw = torch.zeros(self.num_envs, 1, device=self.device)
+            delta_next_yaw = torch.zeros(self.num_envs, 1, device=self.device)
+        
+        # 环境类型标志（如果没有env_class，用默认值）
+        if hasattr(self, 'env_class'):
+            env_type_flag1 = (self.env_class != 17).float()[:, None]
+            env_type_flag2 = (self.env_class == 17).float()[:, None]
+        else:
+            env_type_flag1 = torch.ones(self.num_envs, 1, device=self.device)
+            env_type_flag2 = torch.zeros(self.num_envs, 1, device=self.device)
+        
+        # 动作历史（如果没有action_history_buf，用当前动作）
+        if hasattr(self, 'action_history_buf'):
+            action_history = self.action_history_buf[:, -1]
+        else:
+            action_history = self.actions
+        
+        # 接触信息（如果没有contact_filt，用零填充）
+        if hasattr(self, 'contact_filt'):
+            contact_info = self.contact_filt.float() - 0.5
+        else:
+            # 假设有feet相关的接触力信息
+            if hasattr(self, 'feet_indices'):
+                contact_info = (torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) > 1.0).float() - 0.5
+            else:
+                contact_info = torch.zeros(self.num_envs, 4, device=self.device)  # 假设4个足部
+
         self.obs_buf = torch.cat(
             (
-                # base related
-                self.base_ang_vel * self.obs_scales.ang_vel,
-                self.base_projected_gravity,
-                self.commands[:, :3] * self.commands_scale,
+                # base related - 按照humanoid_robot.py的顺序
+                self.base_ang_vel * self.obs_scales.ang_vel,        # 基座角速度
+                imu_obs,                                            # IMU观测(roll, pitch)
+                0 * delta_yaw,                                      # 朝向差异(置零)
+                delta_yaw,                                          # 朝向差异
+                delta_next_yaw,                                     # 下一个目标朝向差异
+                0 * self.commands[:, 0:2],                          # 命令(置零)
+                self.commands[:, 0:1],                              # 线速度命令
+                env_type_flag1,                                     # 环境类型标志1
+                env_type_flag2,                                     # 环境类型标志2
 
                 # dof related
-                self.dof_pos_offset * self.obs_scales.dof_pos,
-                self.dof_vel * self.obs_scales.dof_vel,
-                self.actions * self.obs_scales.action,
+                self.dof_pos_offset * self.obs_scales.dof_pos,      # DOF位置
+                self.dof_vel * self.obs_scales.dof_vel,             # DOF速度
+                action_history,                                     # 动作历史
+                contact_info,                                       # 接触信息
             ), dim=-1)
+            
+        # 初始化观测历史缓冲区（首次调用时）
+        if self.obs_history_buf is None:
+            self.obs_history_buf = torch.zeros(self.num_envs, self.obs_history_len, self.obs_buf.shape[1], 
+                                              dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # 更新观测历史缓冲区（类似humanoid_robot.py）
+        self.obs_history_buf = torch.where(
+            (self.episode_length_buf <= 1)[:, None, None], 
+            torch.stack([self.obs_buf] * self.obs_history_len, dim=1),
+            torch.cat([
+                self.obs_history_buf[:, 1:],
+                self.obs_buf.unsqueeze(1)
+            ], dim=1)
+        )
 
     def compute_observation_noise(self):
         # add noise if needed, only add noise to the actor observations
@@ -1073,6 +1228,14 @@ class LeggedRobot(BaseTask):
         noise_vec = torch.zeros_like(self.obs_buf[0])
 
         return noise_vec
+
+    def get_history_observations(self):
+        """获取观测历史缓冲区，与humanoid_robot.py对齐"""
+        if hasattr(self, 'obs_history_buf') and self.obs_history_buf is not None:
+            return self.obs_history_buf
+        else:
+            # 如果没有历史观测，返回当前观测的重复
+            return self.obs_buf.unsqueeze(1).repeat(1, self.obs_history_len, 1)
 
     def reset_last_values(self, env_ids):
         self.last_dof_pos[env_ids] = 0.0
@@ -1644,7 +1807,13 @@ class LeggedRobot(BaseTask):
         Returns:
             [torch.Tensor]: Torques sent to the simulation
         """
-        actions_scaled = actions * self.action_scales
+        # 与humanoid_robot.py对齐：优先使用单一action_scale
+        if hasattr(self.cfg.control, 'action_scale') and isinstance(self.cfg.control.action_scale, (int, float)):
+            # 使用单一action_scale（与humanoid_robot.py一致）
+            actions_scaled = actions * self.cfg.control.action_scale
+        else:
+            # 使用per-dof的action_scales（原有逻辑）
+            actions_scaled = actions * self.action_scales
 
         # expand actions from (num_envs, num_actions) to (num_envs, num_dofs)
         actions_expanded = torch.zeros((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float32)
@@ -1874,6 +2043,19 @@ class LeggedRobot(BaseTask):
         self.obs_buf[env_ids] = 0.0
         self.obs_stack[env_ids] = 0.0
         self.obs_stack_num_stacked[env_ids] = 0
+        
+        # 重置动作历史缓冲区
+        if hasattr(self, 'action_history_buf'):
+            self.action_history_buf[env_ids] = 0.0
+        
+        # 重置观测历史缓冲区
+        if hasattr(self, 'obs_history_buf') and self.obs_history_buf is not None:
+            self.obs_history_buf[env_ids] = 0.0
+            
+        # 重置接触历史
+        if hasattr(self, 'contact_filt'):
+            self.contact_filt[env_ids] = False
+            self.last_contacts[env_ids] = False
 
         # critic observations
         self.pri_obs_buf[env_ids] = 0.0
